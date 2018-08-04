@@ -8,7 +8,7 @@ from network import ActorCritic
 from torchvision import transforms
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device = torch.device("cpu")
+# device = torch.device("cpu")
 transform = transforms.Compose([transforms.ToPILImage(),
                                 transforms.Resize(48),
                                 transforms.ToTensor(),
@@ -17,12 +17,12 @@ transform = transforms.Compose([transforms.ToPILImage(),
                                     std=(0.5, 0.5, 0.5))])
 
 
-class TraceQueue(object):
+class QManeger(object):
     """
     single-machine implementation
     """
 
-    def __init__(self):
+    def __init__(self, opt, q_trace, q_batch):
         # traces: 0-[s, a, r, p]
         #         1-[s, a, r, p]
         # trace(s, a, rew, a_prob)
@@ -36,56 +36,57 @@ class TraceQueue(object):
         self.traces_p = []
         self.lock = mp.Lock()
 
-    def push(self, trace):
-        if len(self.traces_s) > 400:
-            print("queue size({}) is too large, wait...".format(len(self.traces_s)))
-            time.sleep(10)
-        # in
-        with self.lock:
+        self.q_trace = q_trace
+        self.q_batch = q_batch
+        self.opt = opt
+
+    def listening(self):
+        while True:
+            trace = self.q_trace.get(block=True)
+            # in
             self.traces_s.append(trace[0])
             self.traces_a.append(trace[1])
             self.traces_r.append(trace[2])
             self.traces_p.append(trace[3])
+            # produce_batch
+            if len(self.traces_s) > self.opt.batch_size:
+                self.produce_batch()
 
-    def pop(self, num):
-        while len(self.traces_s) < num:
-            print("queue waiting...{}/{}".format(len(self.traces_s), num))
-            time.sleep(1)
+    def produce_batch(self):
+        batch_size = self.opt.batch_size
         # out
-        with self.lock:
-            res_s, res_a, res_r, res_p = self.traces_s[:num], self.traces_a[:num], \
-                                         self.traces_r[:num], self.traces_p[:num]
-            del self.traces_s[:num]
-            del self.traces_a[:num]
-            del self.traces_r[:num]
-            del self.traces_p[:num]
+        res_s, res_a, res_r, res_p = self.traces_s[:batch_size], self.traces_a[:batch_size], \
+                                     self.traces_r[:batch_size], self.traces_p[:batch_size]
 
-        # stack batch
-        return torch.stack(res_s, dim=0), \
-               torch.stack(res_a, dim=0), \
-               torch.stack(res_r, dim=0), \
-               torch.stack(res_p, dim=0)
+        del self.traces_s[:batch_size]
+        del self.traces_a[:batch_size]
+        del self.traces_r[:batch_size]
+        del self.traces_p[:batch_size]
+
+        # stack batch and put
+        self.q_batch.put((torch.stack(res_s, dim=0).to(device), torch.stack(res_a, dim=0).to(device),
+                          torch.stack(res_r, dim=0).to(device), torch.stack(res_p, dim=0).to(device)))
 
 
 class Learner(object):
-    def __init__(self, opt, trace_queue):
+    def __init__(self, opt, q_batch):
         self.opt = opt
-        self.trace_queue = trace_queue
+        self.q_batch = q_batch
         self.network = ActorCritic(opt).to(device)
         self.optimizer = Adam(self.network.parameters(), lr=opt.lr)
         self.network.share_memory()
 
     def learning(self):
         torch.manual_seed(self.opt.seed)
-        coef_hat = torch.Tensor([[self.opt.coef_hat]])
-        rho_hat = torch.Tensor([[self.opt.rho_hat]])
+        coef_hat = torch.Tensor([[self.opt.coef_hat]]).to(device)
+        rho_hat = torch.Tensor([[self.opt.rho_hat]]).to(device)
         while True:
             # batch-trace
             # s[batch, n_step+1, 3, width, height]
             # a[batch, n_step, a_space]
             # rew[batch, n_step]
             # a_prob[batch, n_step, a_space]
-            s, a, rew, prob = self.trace_queue.pop(self.opt.batch_size)
+            s, a, rew, prob = self.q_batch.get(block=True)
             ###########################
             # variables we need later #
             ###########################
@@ -161,9 +162,9 @@ class Learner(object):
 
 
 class Actor(object):
-    def __init__(self, opt, trace_queue, learner):
+    def __init__(self, opt, q_trace, learner):
         self.opt = opt
-        self.trace_queue = trace_queue
+        self.q_trace = q_trace
         self.learner = learner
 
         # 游戏
@@ -172,7 +173,7 @@ class Actor(object):
         # a_space = self.env.action_space
 
         # 网络
-        self.behaviour = ActorCritic(opt)  # .to(device)
+        self.behaviour = ActorCritic(opt).to(device)
 
     def performing(self, rank):
         torch.manual_seed(self.opt.seed)
@@ -181,7 +182,7 @@ class Actor(object):
         self.env.seed(self.opt.seed + rank)
 
         s = self.env.reset()
-        s = transform(s).unsqueeze(dim=0)  # .to(device)
+        s = transform(s).unsqueeze(dim=0).to(device)
         episode_length = 0
         r_sum = 0.
         done = True
@@ -191,8 +192,8 @@ class Actor(object):
             self.behaviour.load_state_dict(self.learner.network.state_dict())
             # LSTM
             if done:
-                cx = torch.zeros(1, 256)  # .to(device)
-                hx = torch.zeros(1, 256)  # .to(device)
+                cx = torch.zeros(1, 256).to(device)
+                hx = torch.zeros(1, 256).to(device)
             else:
                 cx = cx.detach()
                 hx = hx.detach()
@@ -207,10 +208,10 @@ class Actor(object):
                 logit = logit.detach()
                 action = torch.bernoulli(logit)
 
-                s, rew, done, info = self.env.step(action.squeeze().numpy().astype(np.int8))
+                s, rew, done, info = self.env.step(action.squeeze().to("cpu").numpy().astype(np.int8))
                 r_sum += rew
-                s = transform(s).unsqueeze(dim=0)  # .to(device)
-                rew = torch.Tensor([rew])  # .to(device)
+                s = transform(s).unsqueeze(dim=0).to(device)
+                rew = torch.Tensor([rew]).to(device)
                 done = done or episode_length >= self.opt.max_episode_length
 
                 #  add to trace - 1
@@ -222,7 +223,7 @@ class Actor(object):
                     r_sum = 0
                     episode_length = 0
                     # game over punishment
-                    trace_rew[-1] = torch.Tensor([-200.])
+                    trace_rew[-1] = torch.Tensor([-200.]).to(device)
                     break
             # add to trace - 2
             trace_s.append(s)
@@ -252,8 +253,8 @@ class Actor(object):
             trace_aprob = zeros
 
             # submit trace to queue
-            self.trace_queue.push((trace_s, trace_a, trace_rew, trace_aprob))
+            self.q_trace.put((trace_s.to("cpu"), trace_a.to("cpu"), trace_rew.to("cpu"), trace_aprob.to("cpu")), block=True)
 
             if done:
                 s = self.env.reset()
-                s = transform(s).unsqueeze(dim=0)  # .to(device)
+                s = transform(s).unsqueeze(dim=0).to(device)
